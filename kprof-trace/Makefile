@@ -13,7 +13,7 @@
 obj-m := kprof.o
 
 # Multi-file module: kprof.ko is built from these object files
-kprof-objs := kprof_main.o kprof_syscall.o kprof_pagefault.o kprof_proc.o
+kprof-objs := kprof_main.o kprof_syscall.o kprof_pagefault.o kprof_lifecycle.o kprof_proc.o
 
 # Kernel build directory
 KDIR ?= /lib/modules/$(shell uname -r)/build

@@ -23,6 +23,14 @@
 #include "report.h"
 #include "procfs_reader.h"
 
+/*
+ * Compiler barrier: prevents the compiler from optimizing away
+ * memory accesses in benchmark loops. Without this, -O2/-O3 will
+ * detect that 'sink' is never used meaningfully and delete the loop.
+ */
+#define COMPILER_BARRIER(val) \
+	asm volatile("" : "+r"(val) : : "memory")
+
 /* Default parameters */
 #define DEFAULT_WORKING_SET_MB  256
 #define DEFAULT_ITERATIONS      (1000 * 1000)
@@ -70,6 +78,7 @@ static double run_tlb_test(volatile char *buf, size_t buf_size,
 	for (i = 0; i < NUM_WARMUP_ITERS && i * stride < buf_size; i++) {
 		sink += buf[(i * stride) % buf_size];
 	}
+	COMPILER_BARRIER(sink);
 
 	/* Timed run */
 	start = time_ns();
@@ -79,11 +88,14 @@ static double run_tlb_test(volatile char *buf, size_t buf_size,
 		offset += stride;
 		if (offset >= buf_size)
 			offset = 0;
+		/* Barrier every 1024 iterations to prevent loop vectorization
+		 * from hiding the memory access pattern */
+		if ((i & 0x3FF) == 0)
+			COMPILER_BARRIER(sink);
 	}
 
 	end = time_ns();
-
-	(void)sink; /* prevent optimization */
+	COMPILER_BARRIER(sink);
 	return (double)(end - start) / (double)iterations;
 }
 

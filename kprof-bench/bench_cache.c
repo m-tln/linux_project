@@ -20,6 +20,12 @@
 #include "report.h"
 #include "procfs_reader.h"
 
+/*
+ * Compiler barrier: prevents DCE and ensures memory accesses happen.
+ */
+#define COMPILER_BARRIER(val) \
+	asm volatile("" : "+r"(val) : : "memory")
+
 /* Working set sizes to test */
 struct cache_test_config {
 	const char *label;
@@ -66,10 +72,12 @@ static double bench_sequential(volatile char *buf, size_t size, uint64_t iters)
 		offset += CACHE_LINE_SIZE;
 		if (offset >= size)
 			offset = 0;
+		if ((i & 0x3FF) == 0)
+			COMPILER_BARRIER(sink);
 	}
 
 	end = time_ns();
-	(void)sink;
+	COMPILER_BARRIER(sink);
 	return (double)(end - start) / (double)iters;
 }
 
@@ -120,13 +128,12 @@ static double bench_random(volatile size_t *buf, size_t num_elements,
 
 	for (i = 0; i < iters; i++) {
 		idx = buf[idx];
+		if ((i & 0x3FF) == 0)
+			COMPILER_BARRIER(idx);
 	}
 
 	end = time_ns();
-
-	/* Prevent dead code elimination */
-	if (idx == (size_t)-1)
-		printf("never\n");
+	COMPILER_BARRIER(idx);
 
 	return (double)(end - start) / (double)iters;
 }

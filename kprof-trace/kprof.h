@@ -12,6 +12,7 @@
 #include <linux/atomic.h>
 #include <linux/proc_fs.h>
 #include <linux/spinlock.h>
+#include <linux/sched.h>
 
 /* Maximum number of syscalls we track (x86_64 has ~450, we cap at 512) */
 #define KPROF_MAX_SYSCALLS  512
@@ -22,7 +23,7 @@
 
 /*
  * Per-syscall statistics.
- * We use atomic operations for lock-free updates from kprobe handlers.
+ * We use atomic operations for lock-free updates from tracepoint handlers.
  */
 struct kprof_syscall_stat {
 	atomic64_t count;       /* number of invocations */
@@ -35,7 +36,8 @@ struct kprof_syscall_stat {
 struct kprof_pagefault_stat {
 	atomic64_t minor_faults;
 	atomic64_t major_faults;
-	atomic64_t last_address; /* last faulting address (informational) */
+	atomic64_t last_address;          /* last faulting address (informational) */
+	atomic64_t last_majflt_snapshot;  /* task->maj_flt snapshot for major/minor detection */
 };
 
 /*
@@ -45,15 +47,14 @@ struct kprof_pagefault_stat {
 struct kprof_state {
 	/* Configuration — protected by state_lock */
 	spinlock_t              state_lock;
-	pid_t                   target_pid;   /* PID to trace, 0 = disabled */
-	bool                    active;       /* tracing enabled? */
+	pid_t                   target_pid;    /* PID to trace, 0 = disabled */
+	pid_t                   exclude_pid;   /* PID to exclude (orchestrator), 0 = none */
+	bool                    active;        /* tracing enabled? */
+	bool                    target_alive;  /* is target process still alive? */
 
 	/* Statistics — lock-free via atomics */
 	struct kprof_syscall_stat   syscalls[KPROF_MAX_SYSCALLS];
 	struct kprof_pagefault_stat pagefaults;
-
-	/* Timestamps for per-syscall timing (per-task, stored in kprobe ctx) */
-	/* We use ktime_get_ns() at entry/exit */
 };
 
 /* Global state instance (defined in kprof_main.c) */
@@ -75,6 +76,13 @@ int  kprof_pagefault_init(void);
 void kprof_pagefault_exit(void);
 
 /*
+ * Process lifecycle tracker — kprof_lifecycle.c
+ * Hooks sched_process_exit to detect when target PID dies.
+ */
+int  kprof_lifecycle_init(void);
+void kprof_lifecycle_exit(void);
+
+/*
  * Procfs interface — kprof_proc.c
  */
 int  kprof_proc_init(void);
@@ -94,10 +102,17 @@ static inline void kprof_reset_stats(void)
 	atomic64_set(&kprof_state.pagefaults.minor_faults, 0);
 	atomic64_set(&kprof_state.pagefaults.major_faults, 0);
 	atomic64_set(&kprof_state.pagefaults.last_address, 0);
+	atomic64_set(&kprof_state.pagefaults.last_majflt_snapshot, 0);
 }
 
 /*
- * Helper: check if current task should be traced
+ * Helper: check if current task should be traced.
+ *
+ * Filters:
+ *   1. Must be active with a valid target_pid
+ *   2. Current task must match target_pid (pid or tgid)
+ *   3. Must NOT be the excluded PID (orchestrator / procfs reader)
+ *   4. Target must still be alive (not a recycled PID)
  */
 static inline bool kprof_should_trace(void)
 {
@@ -105,6 +120,15 @@ static inline bool kprof_should_trace(void)
 		return false;
 	if (kprof_state.target_pid == 0)
 		return false;
+	if (!kprof_state.target_alive)
+		return false;
+
+	/* Exclude the orchestrator PID to avoid observer effect */
+	if (kprof_state.exclude_pid != 0 &&
+	    (current->pid == kprof_state.exclude_pid ||
+	     current->tgid == kprof_state.exclude_pid))
+		return false;
+
 	return current->pid == kprof_state.target_pid ||
 	       current->tgid == kprof_state.target_pid;
 }

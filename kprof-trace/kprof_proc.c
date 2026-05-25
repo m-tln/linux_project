@@ -190,16 +190,20 @@ static const struct proc_ops kprof_pagefaults_ops = {
 static int kprof_config_show(struct seq_file *m, void *v)
 {
 	unsigned long flags;
-	pid_t pid;
-	bool active;
+	pid_t pid, exclude;
+	bool active, alive;
 
 	spin_lock_irqsave(&kprof_state.state_lock, flags);
 	pid = kprof_state.target_pid;
+	exclude = kprof_state.exclude_pid;
 	active = kprof_state.active;
+	alive = kprof_state.target_alive;
 	spin_unlock_irqrestore(&kprof_state.state_lock, flags);
 
 	seq_printf(m, "target_pid: %d\n", pid);
+	seq_printf(m, "exclude_pid: %d\n", exclude);
 	seq_printf(m, "active: %s\n", active ? "yes" : "no");
+	seq_printf(m, "target_alive: %s\n", alive ? "yes" : "no");
 
 	return 0;
 }
@@ -252,9 +256,27 @@ static ssize_t kprof_control_write(struct file *file, const char __user *ubuf,
 		spin_lock_irqsave(&kprof_state.state_lock, flags);
 		kprof_state.target_pid = pid;
 		kprof_state.active = true;
+		kprof_state.target_alive = true;
 		spin_unlock_irqrestore(&kprof_state.state_lock, flags);
 
 		pr_info(KPROF_NAME ": tracing started for PID %d\n", pid);
+
+	} else if (strncmp(buf, "exclude ", 8) == 0) {
+		/*
+		 * "exclude <PID>" — exclude a PID from tracing.
+		 * Used to prevent the observer effect: the orchestrator
+		 * sets its own PID here so its procfs reads don't get counted.
+		 */
+		if (kstrtoint(buf + 8, 10, &pid) != 0 || pid <= 0) {
+			pr_err(KPROF_NAME ": invalid PID in 'exclude' command\n");
+			return -EINVAL;
+		}
+
+		spin_lock_irqsave(&kprof_state.state_lock, flags);
+		kprof_state.exclude_pid = pid;
+		spin_unlock_irqrestore(&kprof_state.state_lock, flags);
+
+		pr_info(KPROF_NAME ": excluding PID %d from tracing\n", pid);
 
 	} else if (strcmp(buf, "stop") == 0) {
 		spin_lock_irqsave(&kprof_state.state_lock, flags);

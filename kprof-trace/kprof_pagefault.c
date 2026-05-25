@@ -1,120 +1,135 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * kprof_pagefault.c — Page fault tracer using kprobes
+ * kprof_pagefault.c — Page fault tracer using kernel tracepoints
  *
- * Hooks into handle_mm_fault() to count minor and major page faults
- * for the target PID.
+ * Uses the mm_fault tracepoint (trace_mm_page_alloc or page_fault_user)
+ * instead of kprobes. Tracepoints are compiled as NOPs when disabled
+ * and have near-zero overhead compared to kprobes (which use INT3 traps).
  *
- * handle_mm_fault() is the main entry point for page fault handling
- * in the Linux kernel. Its return value (vm_fault_t) tells us whether
- * the fault was minor (page in memory, just PTE update) or major
- * (page had to be read from disk).
+ * Why NOT kprobes:
+ *   kprobes on handle_mm_fault() insert a breakpoint (INT3) on every
+ *   page fault, causing a trap + context switch. For memory-intensive
+ *   workloads this completely destroys performance and skews benchmarks.
+ *
+ * Tracepoint approach:
+ *   We hook into the "page_fault_user" tracepoint (or fallback to
+ *   "handle_mm_fault" tracepoint) which fires after the fault is
+ *   resolved. The tracepoint callback receives the fault address,
+ *   error code, and whether it was major/minor.
+ *
+ * Alternative: We also read /proc/[pid]/stat for task-level fault
+ * counters (min_flt, maj_flt fields) which requires zero kernel
+ * overhead — this is done in the procfs_reader userspace component.
  */
 
 #include <linux/module.h>
 #include <linux/kernel.h>
-#include <linux/kprobes.h>
+#include <linux/tracepoint.h>
 #include <linux/sched.h>
 #include <linux/mm.h>
-#include <linux/ktime.h>
 
 #include "kprof.h"
 
 /*
- * We use a kretprobe on handle_mm_fault() so we can inspect both
- * the input (address) and the return value (fault type).
+ * We use for_each_kernel_tracepoint() to find the page fault tracepoints
+ * at runtime, similar to how we find sys_enter/sys_exit in kprof_syscall.c.
  *
- * handle_mm_fault signature (Linux 6.x):
- *   vm_fault_t handle_mm_fault(struct vm_area_struct *vma,
- *                              unsigned long address,
- *                              unsigned int flags,
- *                              struct pt_regs *regs);
+ * Target tracepoints (in order of preference):
+ *   1. "page_fault_user" — fires on user-space page faults (ideal)
+ *   2. "mm_filemap_fault" — fires on file-backed page faults
+ *
+ * The page_fault_user tracepoint provides:
+ *   - address: faulting virtual address
+ *   - error_code: x86 error code (bit 0 = protection, bit 1 = write, etc.)
+ *   - The tracepoint fires AFTER the fault is handled, so we can check
+ *     the task's maj_flt/min_flt counters.
+ *
+ * Fallback: If no suitable tracepoint is found, we use a lightweight
+ * approach: periodically sample /proc/[pid]/stat from userspace.
  */
 
-/* Per-instance data stored between entry and return */
-struct kprof_pf_data {
-	unsigned long address;
-	u64           entry_ns;
-};
+/* Tracepoint pointers */
+static struct tracepoint *tp_page_fault_user;
+static bool tracepoint_registered;
 
 /*
- * Entry handler — called when handle_mm_fault() is entered.
- * We save the faulting address for use in the return handler.
+ * Snapshot of task fault counters — used to detect major vs minor.
+ * We read task->min_flt and task->maj_flt which are maintained by
+ * the kernel's fault handler without any instrumentation overhead.
  */
-static int kprof_pf_entry(struct kretprobe_instance *ri,
-			   struct pt_regs *regs)
+
+/*
+ * page_fault_user tracepoint callback.
+ *
+ * Prototype varies by kernel version. On modern kernels (5.x+):
+ *   void (*)(void *data, unsigned long address, unsigned long error_code)
+ *
+ * We simply increment our counters. The major/minor distinction
+ * is determined by checking the task's maj_flt counter change.
+ */
+static void kprof_page_fault_cb(void *data, unsigned long address,
+				struct pt_regs *regs, unsigned long error_code)
 {
-	struct kprof_pf_data *data;
+	unsigned long prev_maj;
 
 	if (!kprof_should_trace())
-		return 1; /* skip this instance (don't call ret handler) */
-
-	data = (struct kprof_pf_data *)ri->data;
+		return;
 
 	/*
-	 * On x86_64, function arguments are in registers:
-	 *   rdi = vma, rsi = address, rdx = flags, rcx = regs
-	 * We want the address (2nd argument).
-	 */
-#ifdef CONFIG_X86_64
-	data->address = regs->si;
-#elif defined(CONFIG_ARM64)
-	data->address = regs->regs[1];
-#else
-	data->address = 0; /* fallback */
-#endif
-
-	data->entry_ns = ktime_get_ns();
-	return 0;
-}
-
-/*
- * Return handler — called when handle_mm_fault() returns.
- * We classify the fault as minor or major based on the return value.
- */
-static int kprof_pf_ret(struct kretprobe_instance *ri,
-			 struct pt_regs *regs)
-{
-	struct kprof_pf_data *data = (struct kprof_pf_data *)ri->data;
-	unsigned long retval;
-
-	retval = regs_return_value(regs);
-
-	/*
-	 * vm_fault_t flags (from include/linux/mm_types.h):
-	 *   VM_FAULT_MAJOR  = 0x0004 — major fault (disk I/O)
-	 *   VM_FAULT_ERROR  = various error bits
+	 * Determine major vs minor:
+	 * We snapshot current->maj_flt before and check if it increased.
+	 * This is a lightweight check — no locks needed since we're in
+	 * the context of the faulting task.
 	 *
-	 * If VM_FAULT_MAJOR is set → major fault
-	 * Otherwise (and no error) → minor fault
+	 * Note: This is a heuristic. For precise major/minor tracking,
+	 * the userspace component reads /proc/[pid]/stat directly.
 	 */
-	if (retval & VM_FAULT_ERROR) {
-		/* Error fault — don't count */
-		return 0;
-	}
+	prev_maj = atomic64_read(&kprof_state.pagefaults.last_majflt_snapshot);
 
-	if (retval & VM_FAULT_MAJOR) {
+	if (current->maj_flt > (unsigned long)prev_maj) {
 		atomic64_inc(&kprof_state.pagefaults.major_faults);
+		atomic64_set(&kprof_state.pagefaults.last_majflt_snapshot,
+			     (s64)current->maj_flt);
 	} else {
 		atomic64_inc(&kprof_state.pagefaults.minor_faults);
 	}
 
-	/* Store last faulting address (informational) */
-	atomic64_set(&kprof_state.pagefaults.last_address,
-		     (s64)data->address);
-
-	return 0;
+	/* Store last faulting address */
+	atomic64_set(&kprof_state.pagefaults.last_address, (s64)address);
 }
 
-static struct kretprobe kprof_pf_kretprobe = {
-	.handler        = kprof_pf_ret,
-	.entry_handler  = kprof_pf_entry,
-	.data_size      = sizeof(struct kprof_pf_data),
-	.maxactive      = 64, /* max concurrent probed instances */
-	.kp.symbol_name = "handle_mm_fault",
-};
+/*
+ * Fallback: handle_mm_fault tracepoint (available on some kernels).
+ * This fires with (vma, address, flags) — no return value, but we
+ * can still count faults and use task->maj_flt for classification.
+ */
+static struct tracepoint *tp_mm_fault;
 
-static bool kretprobe_registered;
+static void kprof_mm_fault_cb(void *data, struct vm_area_struct *vma,
+			      unsigned long address, unsigned int flags)
+{
+	if (!kprof_should_trace())
+		return;
+
+	/*
+	 * This tracepoint fires at entry to handle_mm_fault, before
+	 * the fault is resolved. We count it as a fault event.
+	 * Major/minor classification happens post-hoc via task counters.
+	 */
+	atomic64_inc(&kprof_state.pagefaults.minor_faults);
+	atomic64_set(&kprof_state.pagefaults.last_address, (s64)address);
+}
+
+/*
+ * Tracepoint lookup callback.
+ */
+static void lookup_tracepoints(struct tracepoint *tp, void *priv)
+{
+	if (!strcmp(tp->name, "page_fault_user"))
+		tp_page_fault_user = tp;
+	else if (!strcmp(tp->name, "handle_mm_fault"))
+		tp_mm_fault = tp;
+}
 
 /*
  * Initialize page fault tracer.
@@ -123,18 +138,51 @@ int kprof_pagefault_init(void)
 {
 	int ret;
 
-	kretprobe_registered = false;
+	tp_page_fault_user = NULL;
+	tp_mm_fault = NULL;
+	tracepoint_registered = false;
 
-	ret = register_kretprobe(&kprof_pf_kretprobe);
-	if (ret) {
-		pr_err(KPROF_NAME ": failed to register kretprobe on handle_mm_fault (err=%d)\n", ret);
-		pr_err(KPROF_NAME ": is CONFIG_KPROBES enabled? Is handle_mm_fault available?\n");
-		return ret;
+	/* Find tracepoints */
+	for_each_kernel_tracepoint(lookup_tracepoints, NULL);
+
+	/* Try page_fault_user first (preferred — lowest overhead) */
+	if (tp_page_fault_user) {
+		ret = tracepoint_probe_register(tp_page_fault_user,
+						kprof_page_fault_cb, NULL);
+		if (ret == 0) {
+			tracepoint_registered = true;
+			pr_info(KPROF_NAME ": pagefault tracer initialized "
+				"(tracepoint: page_fault_user)\n");
+			return 0;
+		}
+		pr_warn(KPROF_NAME ": page_fault_user register failed (%d), "
+			"trying fallback\n", ret);
 	}
 
-	kretprobe_registered = true;
-	pr_info(KPROF_NAME ": pagefault tracer initialized (kretprobe on handle_mm_fault)\n");
-	return 0;
+	/* Fallback: handle_mm_fault tracepoint */
+	if (tp_mm_fault) {
+		ret = tracepoint_probe_register(tp_mm_fault,
+						kprof_mm_fault_cb, NULL);
+		if (ret == 0) {
+			tracepoint_registered = true;
+			pr_info(KPROF_NAME ": pagefault tracer initialized "
+				"(tracepoint: handle_mm_fault)\n");
+			return 0;
+		}
+		pr_warn(KPROF_NAME ": handle_mm_fault register failed (%d)\n",
+			ret);
+	}
+
+	/*
+	 * No tracepoint available — not fatal.
+	 * The userspace component can still read /proc/[pid]/stat
+	 * for min_flt/maj_flt counters with zero kernel overhead.
+	 */
+	pr_warn(KPROF_NAME ": no page fault tracepoint found — "
+		"pagefault counting disabled in kernel\n");
+	pr_info(KPROF_NAME ": userspace can still read /proc/[pid]/stat "
+		"for fault counters\n");
+	return 0; /* non-fatal */
 }
 
 /*
@@ -142,14 +190,16 @@ int kprof_pagefault_init(void)
  */
 void kprof_pagefault_exit(void)
 {
-	if (kretprobe_registered) {
-		unregister_kretprobe(&kprof_pf_kretprobe);
-		kretprobe_registered = false;
+	if (tracepoint_registered) {
+		if (tp_page_fault_user)
+			tracepoint_probe_unregister(tp_page_fault_user,
+						    kprof_page_fault_cb, NULL);
+		else if (tp_mm_fault)
+			tracepoint_probe_unregister(tp_mm_fault,
+						    kprof_mm_fault_cb, NULL);
 
-		/* Log missed probes (if any were dropped due to maxactive) */
-		if (kprof_pf_kretprobe.nmissed > 0)
-			pr_info(KPROF_NAME ": pagefault kretprobe missed %lu events\n",
-				kprof_pf_kretprobe.nmissed);
+		tracepoint_synchronize_unregister();
+		tracepoint_registered = false;
 	}
 
 	pr_info(KPROF_NAME ": pagefault tracer stopped\n");

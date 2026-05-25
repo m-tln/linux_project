@@ -23,6 +23,17 @@
 #include "report.h"
 #include "procfs_reader.h"
 
+/*
+ * Compiler barrier: prevents the compiler from optimizing away
+ * malloc/free calls or memory writes in benchmark loops.
+ */
+#define COMPILER_BARRIER(val) \
+	asm volatile("" : "+r"(val) : : "memory")
+
+/* Force the compiler to consider a pointer as "used" */
+#define USE_PTR(ptr) \
+	asm volatile("" : : "r"(ptr) : "memory")
+
 /* Default parameters */
 #define DEFAULT_ALLOC_ITERS   100000
 #define MAX_ALLOC_PTRS        100000
@@ -60,12 +71,15 @@ static double bench_sequential_alloc(size_t block_size, uint64_t count)
 	/* Allocate */
 	for (i = 0; i < count; i++) {
 		ptrs[i] = malloc(block_size);
-		if (ptrs[i])
-			memset(ptrs[i], 0xAA, block_size > 16 ? 16 : block_size);
+		if (ptrs[i]) {
+			((volatile char *)ptrs[i])[0] = 0xAA;
+			USE_PTR(ptrs[i]);
+		}
 	}
 
 	/* Free */
 	for (i = 0; i < count; i++) {
+		USE_PTR(ptrs[i]);
 		free(ptrs[i]);
 	}
 
@@ -97,8 +111,10 @@ static double bench_random_size_alloc(size_t min_size, size_t max_size,
 	for (i = 0; i < count; i++) {
 		size_t sz = min_size + ((size_t)rand() % (max_size - min_size + 1));
 		ptrs[i] = malloc(sz);
-		if (ptrs[i])
-			((char *)ptrs[i])[0] = 0xBB; /* touch */
+		if (ptrs[i]) {
+			((volatile char *)ptrs[i])[0] = 0xBB;
+			USE_PTR(ptrs[i]);
+		}
 	}
 
 	for (i = 0; i < count; i++) {
@@ -135,13 +151,16 @@ static double bench_mixed_alloc(size_t block_size, uint64_t count)
 	/* Phase 1: allocate all */
 	for (i = 0; i < count; i++) {
 		ptrs[i] = malloc(block_size);
-		if (ptrs[i])
-			((char *)ptrs[i])[0] = 0xCC;
+		if (ptrs[i]) {
+			((volatile char *)ptrs[i])[0] = 0xCC;
+			USE_PTR(ptrs[i]);
+		}
 		ops++;
 	}
 
 	/* Phase 2: free first half */
 	for (i = 0; i < half; i++) {
+		USE_PTR(ptrs[i]);
 		free(ptrs[i]);
 		ptrs[i] = NULL;
 		ops++;
@@ -150,8 +169,10 @@ static double bench_mixed_alloc(size_t block_size, uint64_t count)
 	/* Phase 3: re-allocate first half (reuse freed blocks?) */
 	for (i = 0; i < half; i++) {
 		ptrs[i] = malloc(block_size);
-		if (ptrs[i])
-			((char *)ptrs[i])[0] = 0xDD;
+		if (ptrs[i]) {
+			((volatile char *)ptrs[i])[0] = 0xDD;
+			USE_PTR(ptrs[i]);
+		}
 		ops++;
 	}
 
@@ -181,8 +202,10 @@ static double bench_realloc(uint64_t count)
 
 	for (i = 0; i < count; i++) {
 		ptr = realloc(ptr, cur_size);
-		if (ptr)
-			((char *)ptr)[0] = 0xEE;
+		if (ptr) {
+			((volatile char *)ptr)[0] = 0xEE;
+			USE_PTR(ptr);
+		}
 		cur_size += 64; /* grow by 64 bytes each time */
 
 		/* Reset periodically to avoid huge allocations */
