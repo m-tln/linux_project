@@ -1,52 +1,54 @@
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <time.h>
 
 #define PAGE_SIZE 4096
-// Выделяем 256 МБ памяти (65536 страниц) - это гарантированно переполнит TLB
-#define NUM_PAGES 65536 
+#define NUM_PAGES 65536 // 256 MB
 
-int main(void) {
-    printf("=== Простой генератор TLB Misses ===\n");
-    printf("Мой PID: %d\n", getpid());
-    
-    // Выделяем память
-    size_t size = (size_t)NUM_PAGES * PAGE_SIZE;
-    char *memory = (char *)malloc(size);
-    if (!memory) {
-        perror("Ошибка выделения памяти");
-        return EXIT_FAILURE;
-    }
+volatile sig_atomic_t keep_running = 1;
+void sigint_handler(int dummy)
+{
+	(void)dummy;
+	keep_running = 0;
+}
 
-    printf("\n1. Откройте второй терминал.\n");
-    printf("2. Запустите: ./user_tracker %d\n", getpid());
-    printf("3. Нажмите ENTER в этом окне, чтобы начать нагрузку...\n");
-    getchar(); 
+int main(void)
+{
+	printf("=== TLB Misses ===\n");
+	printf("PID: %d\n", getpid());
 
-    printf("Начинаем генерацию промахов TLB! (Нажмите Ctrl+C для остановки)\n");
+	size_t size = (size_t)NUM_PAGES * PAGE_SIZE;
+	char *memory = (char *)malloc(size);
+	if (!memory) {
+		perror("malloc failed");
+		return EXIT_FAILURE;
+	}
 
-    // Заполняем массив нулями (ядро физически выделит память только при первой записи)
-    for (size_t i = 0; i < size; i += PAGE_SIZE) {
-        memory[i] = 1;
-    }
+	signal(SIGINT, sigint_handler);
 
-    // Бесконечный цикл нагрузки на TLB
-    volatile long dummy = 0; // volatile, чтобы умный компилятор не удалил цикл
-    
-    // Переменная для псевдослучайных прыжков
-    size_t index = 0;
-    // Большое простое число для прыжков (портит жизнь аппаратному prefetcher'у)
-    size_t step = 1009 * PAGE_SIZE; 
+	// Break COW and lazy allocation
+	for (size_t i = 0; i < size; i += PAGE_SIZE) {
+		memory[i] = 1;
+	}
 
-    while (1) {
-        // Читаем байтик памяти
-        dummy += memory[index];
-        
-        // Прыгаем далеко вперед (сдвиг по страницам)
-        index = (index + step) % size;
-    }
+	printf("\n1. Open second terminal.\n");
+	printf("2. Start ./user_tracker %d\n", getpid());
+	printf("3. Tap ENTER to load...\n");
+	getchar();
 
-    free(memory);
-    return EXIT_SUCCESS;
+	printf("Start TLB misses! (Ctrl+C to exit)\n");
+
+	volatile long dummy = 0;
+	size_t index = 0;
+	size_t step = 1009 * PAGE_SIZE;
+
+	while (keep_running) {
+
+		dummy += memory[index];
+		index = (index + step) % size;
+	}
+
+	free(memory);
+	return EXIT_SUCCESS;
 }
