@@ -29,7 +29,7 @@ add_custom_target(kernel_clean
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     COMMENT "Cleaning Kernel Module via Kbuild..."
 )
-# Привязываем очистку ядра к общей команде clean
+
 set_property(GLOBAL APPEND PROPERTY ADDITIONAL_MAKE_CLEAN_FILES kernel_clean)
 
 # Get this message cmake -B build -G Ninja

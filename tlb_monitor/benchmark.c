@@ -1,8 +1,11 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
+// lscpu
+// cpuid | grep -i "data tlb"
 #define PAGE_SIZE 4096
 #define NUM_PAGES 65536 // 256 MB
 
@@ -30,6 +33,12 @@ int main(void)
 	// Break COW and lazy allocation
 	for (size_t i = 0; i < size; i += PAGE_SIZE) {
 		memory[i] = 1;
+	}
+
+	// cat /sys/kernel/mm/transparent_hugepage/enabled
+	// Break huge pages
+	if (madvise(memory, size, MADV_NOHUGEPAGE) != 0) {
+		perror("madvise (MADV_NOHUGEPAGE) failed, but keep going");
 	}
 
 	printf("\n1. Open second terminal.\n");
